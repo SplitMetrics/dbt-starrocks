@@ -14,21 +14,31 @@
  * limitations under the License.
  */
 
+{# External catalogs (Iceberg, Hive, ...) expose information_schema.tables but
+   not materialized_views, so the MV join only applies to the internal catalog. #}
 {% macro starrocks__list_relations_without_caching(schema_relation) -%}
+  {%- set catalog = schema_relation.database -%}
+  {%- set is_internal = catalog is none or catalog == '' or catalog == 'default_catalog' -%}
   {% call statement('list_relations_without_caching', fetch_result=True) %}
     select
-      null as "database",
+      {% if catalog %}'{{ catalog }}'{% else %}null{% endif %} as "database",
       tbl.table_name as name,
       tbl.table_schema as "schema",
+    {% if is_internal %}
       case when tbl.table_type = 'BASE TABLE' or tbl.table_type = 'TABLE' then 'table'
            when tbl.table_type = 'VIEW' and mv.table_name is null then 'view'
            when tbl.table_type = 'VIEW' and mv.table_name is not null then 'materialized_view'
            when tbl.table_type = 'SYSTEM VIEW' then 'system_view'
            else 'unknown' end as table_type
-    from information_schema.tables tbl
-    left join default_catalog.information_schema.materialized_views mv
+    from {% if catalog %}{{ schema_relation.quoted(catalog) }}.{% endif %}information_schema.tables tbl
+    left join {% if catalog %}{{ schema_relation.quoted(catalog) }}{% else %}default_catalog{% endif %}.information_schema.materialized_views mv
     on tbl.TABLE_SCHEMA = mv.TABLE_SCHEMA
     and tbl.TABLE_NAME = mv.TABLE_NAME
+    {% else %}
+      case when tbl.table_type = 'VIEW' then 'view'
+           else 'table' end as table_type
+    from {{ schema_relation.quoted(catalog) }}.information_schema.tables tbl
+    {% endif %}
     where tbl.table_schema = '{{ schema_relation.schema }}'
   {% endcall %}
   {{ return(load_result('list_relations_without_caching').table) }}
@@ -93,7 +103,7 @@
 
 {% macro starrocks__list_schemas(database) -%}
     {% call statement('list_schemas', fetch_result=True, auto_begin=False) -%}
-      select distinct schema_name from information_schema.schemata
+      select distinct schema_name from {% if database %}`{{ database }}`.{% endif %}information_schema.schemata
     {%- endcall %}
     {{ return(load_result('list_schemas').table) }}
 {%- endmacro %}
