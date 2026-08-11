@@ -175,36 +175,14 @@ class StarRocksConnectionManager(SQLConnectionManager):
         try:
             connection.handle = mysql.connector.connect(**kwargs)
             connection.state = 'open'
-        except mysql.connector.Error:
+        except mysql.connector.Error as e:
+            logger.debug("Got an error when attempting to open a StarRocks "
+                         "connection: '{}'".format(e))
 
-            try:
-                logger.debug("Failed connection without supplying the `database`. "
-                             "Trying again with `database` included.")
+            connection.handle = None
+            connection.state = 'fail'
 
-                # Try again with the database included
-                database_toBeCreated = kwargs["database"]
-                kwargs["database"] = "information_schema"
-
-                connection.handle = mysql.connector.connect(**kwargs)
-                connection.state = 'open'
-
-                mycursor = connection.handle.cursor()
-
-                mycursor.execute("CREATE DATABASE " + database_toBeCreated)
-                kwargs["database"] = database_toBeCreated
-
-                connection.handle = mysql.connector.connect(**kwargs)
-                connection.state = 'open'
-
-            except mysql.connector.Error as e:
-
-                logger.debug("Got an error when attempting to open a StarRocks "
-                             "connection: '{}'".format(e))
-
-                connection.handle = None
-                connection.state = 'fail'
-
-                raise dbt_common.exceptions.ConnectionError(str(e))
+            raise dbt_common.exceptions.ConnectionError(str(e))
 
         if credentials.version is None:
             cursor = connection.handle.cursor()
