@@ -85,11 +85,12 @@ class StarRocksRelation(BaseRelation):
 
     def render(self):
         if self.database is not None:
-            return "{catalog}.{database}.{table}".format(
-                catalog=self.quoted(self.database),
-                database=self.quoted(self.schema),
-                table=self.quoted(self.identifier)
-            )
+            parts = [self.quoted(self.database)]
+            if self.schema is not None:
+                parts.append(self.quoted(self.schema))
+            if self.identifier is not None:
+                parts.append(self.quoted(self.identifier))
+            return ".".join(parts)
         if self.include_policy.database and self.include_policy.schema:
             raise DbtRuntimeError(
                 "Got a StarRocks relation with schema and database set to include, but only one can be set"
