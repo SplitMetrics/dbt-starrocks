@@ -162,7 +162,7 @@ class StarRocksConnectionManager(SQLConnectionManager):
 
         credentials = cls.get_credentials(connection.credentials)
         kwargs = {"host": credentials.host, "username": credentials.username,
-                  "password": credentials.password, "database": credentials.catalog + "." + credentials.schema, "auth_plugin":credentials.auth_plugin}
+                  "password": credentials.password, "auth_plugin": credentials.auth_plugin}
 
         kwargs["buffered"] = True
 
@@ -175,6 +175,12 @@ class StarRocksConnectionManager(SQLConnectionManager):
         try:
             connection.handle = mysql.connector.connect(**kwargs)
             connection.state = 'open'
+
+            if credentials.catalog:
+                cursor = connection.handle.cursor()
+                escaped_catalog = credentials.catalog.replace("`", "``")
+                cursor.execute("SET CATALOG `{}`".format(escaped_catalog))
+                cursor.close()
         except mysql.connector.Error as e:
             logger.debug("Got an error when attempting to open a StarRocks "
                          "connection: '{}'".format(e))
