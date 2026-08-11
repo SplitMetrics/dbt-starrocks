@@ -1,9 +1,17 @@
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
+from jinja2 import Environment, StrictUndefined
 
 from dbt.adapters.starrocks.relation import (
     StarRocksIncludePolicy,
     StarRocksQuotePolicy,
     StarRocksRelation,
+)
+
+MACROS_DIR = (
+    Path(__file__).resolve().parents[2] / "dbt" / "include" / "starrocks" / "macros"
 )
 
 
@@ -111,3 +119,58 @@ class TestListRelationsCarriesCatalog:
         )
 
         assert relations[0].database is None
+
+
+class TestColumnsLookup:
+    def _render(self, relation):
+        statements = []
+
+        def statement(name, fetch_result=False, caller=None):
+            statements.append((name, " ".join(caller().split())))
+            return ""
+
+        def fail_if_converted(*args):
+            raise AssertionError("empty metadata must not be converted")
+
+        environment = Environment(
+            undefined=StrictUndefined, extensions=["jinja2.ext.do"]
+        )
+        environment.globals.update(
+            statement=statement,
+            load_result=lambda name: SimpleNamespace(table=SimpleNamespace(rows=[])),
+            starrocks__sql_convert_columns_in_relation=fail_if_converted,
+        )
+        environment.globals["return"] = lambda value: value
+        template = environment.from_string(
+            (MACROS_DIR / "adapters" / "columns.sql").read_text()
+            + "\n{{ starrocks__get_columns_in_relation(relation) }}"
+        )
+        template.render(relation=relation)
+        return statements
+
+    def test_lookup_is_catalog_qualified_and_skips_desc_on_empty(self):
+        relation = StarRocksRelation.create(
+            database="glue_iceberg_catalog",
+            schema="mmp_silver",
+            identifier="events",
+            type="table",
+        )
+        assert self._render(relation) == [
+            (
+                "get_columns_in_relation",
+                "select column_name, data_type, character_maximum_length, "
+                "numeric_precision, numeric_scale from "
+                "`glue_iceberg_catalog`.INFORMATION_SCHEMA.columns "
+                "where table_name = 'events' "
+                "and table_schema = 'mmp_silver' order by ordinal_position",
+            )
+        ]
+
+    def test_lookup_without_catalog_matches_upstream(self):
+        relation = StarRocksRelation.create(
+            schema="mmp_silver", identifier="events", type="table"
+        )
+        statements = self._render(relation)
+        assert len(statements) == 1
+        assert "INFORMATION_SCHEMA.columns" in statements[0][1]
+        assert "`mmp_silver`" not in statements[0][1].split("where")[0]
