@@ -162,12 +162,48 @@
   {% endif -%}
 {%- endmacro -%}
 
-{% macro starrocks__external_table() -%}
+{# Resolve the storage location for a new external (Iceberg) table: an explicit
+   base via the external_table_location_base var / DBT_EXTERNAL_TABLE_LOCATION_BASE
+   env, else derived from the target schema's `show create database` location. #}
+{% macro starrocks__external_table_location(relation) -%}
+  {%- set configured_base = var('external_table_location_base', env_var('DBT_EXTERNAL_TABLE_LOCATION_BASE', '')) -%}
+
+  {%- if configured_base -%}
+    {{ return(configured_base.rstrip('/') ~ '/' ~ relation.identifier) }}
+  {%- endif -%}
+
+  {%- if not execute -%}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {%- if relation.database and relation.database != 'default_catalog' -%}
+    {%- do run_query('set catalog ' ~ relation.quoted(relation.database)) -%}
+  {%- endif -%}
+  {%- set database_location_result = run_query('show create database ' ~ relation.quoted(relation.schema)) -%}
+  {%- if database_location_result is none or database_location_result.rows | length == 0 -%}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {%- set database_ddl = database_location_result.rows[0][1] -%}
+  {%- set location_match = modules.re.search('"location"\\s*=\\s*"([^"]+)"', database_ddl) -%}
+  {%- if location_match is none -%}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {{ return(location_match.group(1).rstrip('/') ~ '/' ~ relation.identifier) }}
+{%- endmacro %}
+
+{# With a relation: render external-catalog CTAS options — a plain parenthesized
+   partition column list (the Iceberg transform syntax; the OLAP Expr/Range forms
+   below don't apply to external tables) and PROPERTIES with a derived location
+   when none is configured. Without a relation: legacy rendering, unchanged. #}
+{% macro starrocks__external_table(relation=none) -%}
   {% set properties = config.get('properties') %}
   {% set partition_by = config.get('partition_by') %}
   {%- set partition_type = config.get('partition_type', 'Expr') -%}
   {%- set partition_by_init = config.get('partition_by_init') -%}
 
+  {%- if relation is none -%}
   {% if partition_by is not none %}
     {{ starrocks__partition_by(partition_type, partition_by, partition_by_init) }}
   {% endif %}
@@ -179,4 +215,31 @@
       {% endfor %}
     )
   {% endif %}
+  {%- else -%}
+  {% if partition_by is not none %}
+    PARTITION BY (
+      {%- for col in partition_by -%}
+        {{ col }} {%- if not loop.last -%}, {%- endif -%}
+      {%- endfor -%}
+    )
+  {% endif %}
+
+  {%- if properties is none -%}
+    {%- set properties = {} -%}
+  {%- endif -%}
+  {%- if properties.get('location') is none -%}
+    {%- set table_location = starrocks__external_table_location(relation) -%}
+    {%- if table_location is not none -%}
+      {%- do properties.update({'location': table_location}) -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  {% if properties %}
+    PROPERTIES (
+      {% for key, value in properties.items() %}
+        "{{ key }}" = "{{ value }}"{% if not loop.last %},{% endif %}
+      {% endfor %}
+    )
+  {% endif %}
+  {%- endif -%}
 {%- endmacro %}

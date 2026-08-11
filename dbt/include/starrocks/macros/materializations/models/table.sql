@@ -32,7 +32,7 @@
   {%- endif -%}
 
   {%- if is_external -%}
-    {{ starrocks__external_table() }}
+    {{ starrocks__external_table(relation) }}
   {%- elif engine == 'OLAP' -%}
     {{ starrocks__olap_table(True) }}
   {%- else -%}
