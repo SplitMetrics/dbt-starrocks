@@ -48,6 +48,9 @@ class StarRocksCredentials(Credentials):
     use_pure: Optional[str] = None
     is_async: Optional[bool] = False
     async_query_timeout: Optional[int] = 300
+    connection_timeout: Optional[int] = 10
+    read_timeout: Optional[int] = 1800
+    write_timeout: Optional[int] = 1800
     poll_interval: Optional[int] = 1
     poll_max_delay: Optional[int] = 600
     poll_factor: Optional[float] = 2.0
@@ -91,6 +94,9 @@ class StarRocksCredentials(Credentials):
             "use_pure",
             "is_async",
             "async_query_timeout",
+            "connection_timeout",
+            "read_timeout",
+            "write_timeout",
             "poll_interval",
             "poll_max_delay",
             "poll_factor",
@@ -168,6 +174,11 @@ class StarRocksConnectionManager(SQLConnectionManager):
 
         if credentials.port:
             kwargs["port"] = credentials.port
+
+        for timeout_key in ("connection_timeout", "read_timeout", "write_timeout"):
+            timeout_value = getattr(credentials, timeout_key, None)
+            if timeout_value is not None:
+                kwargs[timeout_key] = timeout_value
 
         if credentials.use_pure in ["true", "True"]:
             kwargs["use_pure"] = True
