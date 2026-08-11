@@ -313,7 +313,7 @@ class StarRocksAdapter(SQLAdapter):
                 )
             _database, name, schema, type_info = row
             relation = self.Relation.create(
-                database=None,
+                database=schema_relation.database,
                 schema=schema,
                 identifier=name,
                 type=self.Relation.get_relation_type(type_info),
