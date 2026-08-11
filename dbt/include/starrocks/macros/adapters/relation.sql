@@ -34,7 +34,8 @@
       {% if to_relation.table.endswith('__dbt_backup') %}
         drop view if exists {{ from_relation }}
       {% else %}
-        {% set results = run_query("select VIEW_DEFINITION as sql from information_schema.views where TABLE_SCHEMA='"
+        {% set catalog_prefix = from_relation.quoted(from_relation.database) + "." if from_relation.database else "" %}
+        {% set results = run_query("select VIEW_DEFINITION as sql from " + catalog_prefix + "information_schema.views where TABLE_SCHEMA='"
              + from_relation.schema + "' and TABLE_NAME='" + from_relation.table + "'") %}
         create view {{ to_relation }} as {{ results[0]['sql'] }}
         {% call statement('drop_view') %}

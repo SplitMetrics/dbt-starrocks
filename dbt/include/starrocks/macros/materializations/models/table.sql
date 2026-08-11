@@ -22,7 +22,7 @@
 
   {{ sql_header if sql_header is not none }}
 
-  create table {{ relation.include(database=False) }}
+  create table {{ relation }}
   {%- if indexs is not none %} (
     {%- for index in indexs %}
       {%- set columns = index.get('columns') %}
