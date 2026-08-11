@@ -23,7 +23,7 @@
         numeric_precision,
         numeric_scale
 
-    from INFORMATION_SCHEMA.columns
+    from {% if relation.database %}{{ relation.quoted(relation.database) }}.{% endif %}INFORMATION_SCHEMA.columns
     where table_name = '{{ relation.identifier }}'
       {% if relation.schema %}
       and table_schema = '{{ relation.schema }}'
@@ -32,10 +32,10 @@
   {% endcall %}
 
   {% set table = load_result('get_columns_in_relation').table %}
-  
+
   {% if table.rows %}
     {% call statement('desc_columns_in_relation', fetch_result=True) %}
-      desc `{{ relation.schema }}`.`{{ relation.identifier }}`
+      desc {{ relation }}
     {% endcall %}
     {% set desc_table = load_result('desc_columns_in_relation').table %}
     {{ return(starrocks__sql_convert_columns_in_relation(relation, table, desc_table)) }}
