@@ -72,16 +72,6 @@ class StarRocksRelation(BaseRelation):
     def is_materialized_view(self) -> bool:
         return self.type == StarRocksRelationType.MaterializedView
 
-    def render(self):
-        if self.database is not None:
-            parts = [self.quoted(self.database)]
-            if self.schema is not None:
-                parts.append(self.quoted(self.schema))
-            if self.identifier is not None:
-                parts.append(self.quoted(self.identifier))
-            return ".".join(parts)
-        return super().render()
-
     def init_type_map(self, desc_table):
         for row in desc_table:
             # name -> type

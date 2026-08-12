@@ -103,7 +103,8 @@
 
 {% macro starrocks__list_schemas(database) -%}
     {% call statement('list_schemas', fetch_result=True, auto_begin=False) -%}
-      select distinct schema_name from {% if database %}`{{ database }}`.{% endif %}information_schema.schemata
+      {#- dbt-core passes database pre-rendered (already quoted) -#}
+      select distinct schema_name from {% if database %}{{ database }}.{% endif %}information_schema.schemata
     {%- endcall %}
     {{ return(load_result('list_schemas').table) }}
 {%- endmacro %}
