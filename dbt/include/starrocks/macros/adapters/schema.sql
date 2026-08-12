@@ -14,6 +14,13 @@
  * limitations under the License.
  */
 
+{# Schema creation is intentionally left to dbt's default `create_schema`, which
+   renders `create schema if not exists <db>` — and, for a relation carrying a
+   catalog, `<catalog>.<db>`. `drop_schema` below mirrors that catalog-qualified
+   form. StarRocks accepts the catalog-qualified `CREATE/DROP DATABASE
+   <catalog>.<db>` for external (e.g. Iceberg) catalogs since v3.2 — the engine
+   parser and AST route it to the named catalog — even though the SQL reference
+   docs only show the unqualified name plus a `SET CATALOG` workflow. #}
 {% macro starrocks__drop_schema(relation) -%}
   {% call statement('drop_schema') %}
     drop schema if exists {{ relation.without_identifier() }}

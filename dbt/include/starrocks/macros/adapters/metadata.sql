@@ -21,7 +21,7 @@
   {%- set is_internal = catalog is none or catalog == '' or catalog == 'default_catalog' -%}
   {% call statement('list_relations_without_caching', fetch_result=True) %}
     select
-      {% if catalog %}'{{ catalog }}'{% else %}null{% endif %} as "database",
+      {% if catalog %}'{{ catalog | replace("'", "''") }}'{% else %}null{% endif %} as "database",
       tbl.table_name as name,
       tbl.table_schema as "schema",
     {% if is_internal %}
@@ -103,8 +103,17 @@
 
 {% macro starrocks__list_schemas(database) -%}
     {% call statement('list_schemas', fetch_result=True, auto_begin=False) -%}
-      {#- dbt-core passes database pre-rendered (already quoted) -#}
-      select distinct schema_name from {% if database %}{{ database }}.{% endif %}information_schema.schemata
+      {#- dbt-core's create_schemas passes database pre-rendered (already
+          backtick-quoted via str(relation)), while check_schema_exists passes
+          the raw component — pass quoted values through, quote+escape the rest -#}
+      {%- if database and database.startswith('`') -%}
+        {%- set catalog_prefix = database ~ '.' -%}
+      {%- elif database -%}
+        {%- set catalog_prefix = '`' ~ database | replace('`', '``') ~ '`.' -%}
+      {%- else -%}
+        {%- set catalog_prefix = '' -%}
+      {%- endif -%}
+      select distinct schema_name from {{ catalog_prefix }}information_schema.schemata
     {%- endcall %}
     {{ return(load_result('list_schemas').table) }}
 {%- endmacro %}

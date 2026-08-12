@@ -49,8 +49,10 @@ class StarRocksCredentials(Credentials):
     is_async: Optional[bool] = False
     async_query_timeout: Optional[int] = 300
     connection_timeout: Optional[int] = 10
-    read_timeout: Optional[int] = 1800
-    write_timeout: Optional[int] = 1800
+    # Default to None (unlimited) so long server-side queries are not capped;
+    # a socket-read/write ceiling only applies when explicitly configured.
+    read_timeout: Optional[int] = None
+    write_timeout: Optional[int] = None
     poll_interval: Optional[int] = 1
     poll_max_delay: Optional[int] = 600
     poll_factor: Optional[float] = 2.0
@@ -59,6 +61,9 @@ class StarRocksCredentials(Credentials):
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+        # the custom __init__ bypasses dataclass machinery, so run the
+        # validation explicitly
+        self.__post_init__()
 
     def __post_init__(self):
         # starrocks classifies database and schema as the same thing
@@ -72,6 +77,10 @@ class StarRocksCredentials(Credentials):
                 f"On StarRocks, database must be omitted or have the same value as"
                 f" schema."
             )
+        # dbt-core defaults a source's database to credentials.database; the
+        # database slot carries the catalog, so the schema alias must not leak
+        # into three-part renders
+        self.database = None
 
     @property
     def type(self):
@@ -187,7 +196,9 @@ class StarRocksConnectionManager(SQLConnectionManager):
             connection.handle = mysql.connector.connect(**kwargs)
             connection.state = 'open'
 
-            if credentials.catalog:
+            # default_catalog is already the session catalog; skipping SET CATALOG
+            # keeps connections working on StarRocks servers that predate it.
+            if credentials.catalog and credentials.catalog != 'default_catalog':
                 cursor = connection.handle.cursor()
                 escaped_catalog = credentials.catalog.replace("`", "``")
                 cursor.execute("SET CATALOG `{}`".format(escaped_catalog))

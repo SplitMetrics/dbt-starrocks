@@ -20,9 +20,9 @@
    flows through when it is not the default, so single-catalog setups keep
    rendering two-part exactly as before. #}
 {% macro starrocks__generate_database_name(custom_database_name=none, node=none) -%}
-  {%- if custom_database_name is not none -%}
-    {{ return(custom_database_name | trim) }}
-  {%- endif -%}
+  {# A model-level +database is a StarRocks schema alias, not a catalog, so it
+     must not flow into the catalog slot; the catalog comes only from +catalog
+     or the profile catalog below (upstream returned None here unconditionally). #}
   {%- set configured_catalog = none -%}
   {%- if node is not none and node.config is defined -%}
     {%- set configured_catalog = node.config.get('catalog') -%}

@@ -34,6 +34,15 @@
       {% if to_relation.table.endswith('__dbt_backup') %}
         drop view if exists {{ from_relation }}
       {% else %}
+        {# information_schema.views is served only from the internal metastore, so it
+           returns no definition for external-catalog (Iceberg/Hive) views; copying a
+           missing definition would silently recreate a wrong view, so fail loudly. #}
+        {% if from_relation.database and from_relation.database != 'default_catalog' %}
+          {%- set msg -%}
+            cannot rename view {{ from_relation }} in external catalog "{{ from_relation.database }}": view definitions are not readable from information_schema.views for external catalogs
+          {%- endset -%}
+          {{ exceptions.raise_compiler_error(msg) }}
+        {% endif %}
         {% set catalog_prefix = from_relation.quoted(from_relation.database) + "." if from_relation.database else "" %}
         {% set results = run_query("select VIEW_DEFINITION as sql from " + catalog_prefix + "information_schema.views where TABLE_SCHEMA='"
              + from_relation.schema + "' and TABLE_NAME='" + from_relation.table + "'") %}

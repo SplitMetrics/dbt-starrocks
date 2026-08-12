@@ -176,10 +176,17 @@
     {{ return(none) }}
   {%- endif -%}
 
-  {%- if relation.database and relation.database != 'default_catalog' -%}
+  {# SHOW CREATE DATABASE resolves against the session catalog and cannot be
+     catalog-qualified, so switch into the external catalog to read and switch
+     back afterwards to leave the session catalog unchanged. #}
+  {%- set switched_catalog = relation.database and relation.database != 'default_catalog' -%}
+  {%- if switched_catalog -%}
     {%- do run_query('set catalog ' ~ relation.quoted(relation.database)) -%}
   {%- endif -%}
   {%- set database_location_result = run_query('show create database ' ~ relation.quoted(relation.schema)) -%}
+  {%- if switched_catalog -%}
+    {%- do run_query('set catalog ' ~ relation.quoted(target.catalog)) -%}
+  {%- endif -%}
   {%- if database_location_result is none or database_location_result.rows | length == 0 -%}
     {{ return(none) }}
   {%- endif -%}
