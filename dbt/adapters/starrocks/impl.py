@@ -98,6 +98,15 @@ class StarRocksAdapter(SQLAdapter):
         sql_clean = sql.strip().replace('\n', '')
         sql_clean = re.sub(r'\s+', ' ', sql_clean).strip().lower()
 
+        # Drop comment blocks before matching. An optimizer hint sits between
+        # the keyword and the rest of the statement -- `insert /*+SET_VAR(...)*/
+        # overwrite t` is valid StarRocks -- and a dbt query comment can lead
+        # the statement. Either one hides an ETL statement from the patterns
+        # below, which silently routes a long-running write through the
+        # synchronous path instead of SUBMIT TASK.
+        sql_clean = re.sub(r'/\*.*?\*/', ' ', sql_clean)
+        sql_clean = re.sub(r'\s+', ' ', sql_clean).strip()
+
         # Note: # Supported ETL patterns from StarRocks documentation
         # https://docs.starrocks.io/docs/sql-reference/sql-statements/loading_unloading/ETL/SUBMIT_TASK/
         #
