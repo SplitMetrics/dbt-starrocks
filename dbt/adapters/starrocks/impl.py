@@ -293,9 +293,6 @@ class StarRocksAdapter(SQLAdapter):
         return exists
 
     def get_relation(self, database: Optional[str], schema: str, identifier: str):
-        if not self.Relation.get_default_include_policy().database:
-            database = None
-
         return super().get_relation(database, schema, identifier)
 
     def list_relations_without_caching(
@@ -313,7 +310,7 @@ class StarRocksAdapter(SQLAdapter):
                 )
             _database, name, schema, type_info = row
             relation = self.Relation.create(
-                database=None,
+                database=schema_relation.database,
                 schema=schema,
                 identifier=name,
                 type=self.Relation.get_relation_type(type_info),

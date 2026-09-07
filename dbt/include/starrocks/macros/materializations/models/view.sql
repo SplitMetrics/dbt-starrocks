@@ -31,7 +31,7 @@
 {% macro starrocks__stored_view_definition_internal(relation) -%}
   {%- set query -%}
     select view_definition as view_def
-    from information_schema.views
+    from {% if relation.database %}{{ relation.quoted(relation.database) }}.{% endif %}information_schema.views
     where table_schema = '{{ relation.schema }}'
       and table_name   = '{{ relation.identifier }}'
   {%- endset -%}

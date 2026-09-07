@@ -48,6 +48,11 @@ class StarRocksCredentials(Credentials):
     use_pure: Optional[str] = None
     is_async: Optional[bool] = False
     async_query_timeout: Optional[int] = 300
+    connection_timeout: Optional[int] = 10
+    # Default to None (unlimited) so long server-side queries are not capped;
+    # a socket-read/write ceiling only applies when explicitly configured.
+    read_timeout: Optional[int] = None
+    write_timeout: Optional[int] = None
     poll_interval: Optional[int] = 1
     poll_max_delay: Optional[int] = 600
     poll_factor: Optional[float] = 2.0
@@ -56,6 +61,9 @@ class StarRocksCredentials(Credentials):
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+        # the custom __init__ bypasses dataclass machinery, so run the
+        # validation explicitly
+        self.__post_init__()
 
     def __post_init__(self):
         # starrocks classifies database and schema as the same thing
@@ -69,6 +77,10 @@ class StarRocksCredentials(Credentials):
                 f"On StarRocks, database must be omitted or have the same value as"
                 f" schema."
             )
+        # dbt-core defaults a source's database to credentials.database; the
+        # database slot carries the catalog, so the schema alias must not leak
+        # into three-part renders
+        self.database = None
 
     @property
     def type(self):
@@ -91,6 +103,9 @@ class StarRocksCredentials(Credentials):
             "use_pure",
             "is_async",
             "async_query_timeout",
+            "connection_timeout",
+            "read_timeout",
+            "write_timeout",
             "poll_interval",
             "poll_max_delay",
             "poll_factor",
@@ -162,12 +177,17 @@ class StarRocksConnectionManager(SQLConnectionManager):
 
         credentials = cls.get_credentials(connection.credentials)
         kwargs = {"host": credentials.host, "username": credentials.username,
-                  "password": credentials.password, "database": credentials.catalog + "." + credentials.schema, "auth_plugin":credentials.auth_plugin}
+                  "password": credentials.password, "auth_plugin": credentials.auth_plugin}
 
         kwargs["buffered"] = True
 
         if credentials.port:
             kwargs["port"] = credentials.port
+
+        for timeout_key in ("connection_timeout", "read_timeout", "write_timeout"):
+            timeout_value = getattr(credentials, timeout_key, None)
+            if timeout_value is not None:
+                kwargs[timeout_key] = timeout_value
 
         if credentials.use_pure in ["true", "True"]:
             kwargs["use_pure"] = True
@@ -175,36 +195,22 @@ class StarRocksConnectionManager(SQLConnectionManager):
         try:
             connection.handle = mysql.connector.connect(**kwargs)
             connection.state = 'open'
-        except mysql.connector.Error:
 
-            try:
-                logger.debug("Failed connection without supplying the `database`. "
-                             "Trying again with `database` included.")
+            # default_catalog is already the session catalog; skipping SET CATALOG
+            # keeps connections working on StarRocks servers that predate it.
+            if credentials.catalog and credentials.catalog != 'default_catalog':
+                cursor = connection.handle.cursor()
+                escaped_catalog = credentials.catalog.replace("`", "``")
+                cursor.execute("SET CATALOG `{}`".format(escaped_catalog))
+                cursor.close()
+        except mysql.connector.Error as e:
+            logger.debug("Got an error when attempting to open a StarRocks "
+                         "connection: '{}'".format(e))
 
-                # Try again with the database included
-                database_toBeCreated = kwargs["database"]
-                kwargs["database"] = "information_schema"
+            connection.handle = None
+            connection.state = 'fail'
 
-                connection.handle = mysql.connector.connect(**kwargs)
-                connection.state = 'open'
-
-                mycursor = connection.handle.cursor()
-
-                mycursor.execute("CREATE DATABASE " + database_toBeCreated)
-                kwargs["database"] = database_toBeCreated
-
-                connection.handle = mysql.connector.connect(**kwargs)
-                connection.state = 'open'
-
-            except mysql.connector.Error as e:
-
-                logger.debug("Got an error when attempting to open a StarRocks "
-                             "connection: '{}'".format(e))
-
-                connection.handle = None
-                connection.state = 'fail'
-
-                raise dbt_common.exceptions.ConnectionError(str(e))
+            raise dbt_common.exceptions.ConnectionError(str(e))
 
         if credentials.version is None:
             cursor = connection.handle.cursor()
