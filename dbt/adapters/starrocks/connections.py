@@ -32,10 +32,10 @@ from dbt.adapters.sql import SQLConnectionManager
 from dbt.adapters.events.logging import AdapterLogger
 from typing import Optional, Union
 
-from dbt.adapters.starrocks.iceberg_response_recovery import (
+from dbt.adapters.starrocks.insert_overwrite_response_recovery import (
     RecoveryObserver,
-    extracted_insert_match,
-    mark_extracted_insert,
+    overwrite_insert_match,
+    mark_overwrite_insert,
 )
 
 logger = AdapterLogger("starrocks")
@@ -255,37 +255,37 @@ class StarRocksConnectionManager(SQLConnectionManager):
 
     def add_query(self, sql, auto_begin=True, bindings=None, abridge_sql_log=False,
                   retryable_exceptions=tuple(), retry_limit=1):
-        match = extracted_insert_match(sql)
+        match = overwrite_insert_match(sql)
         if match is None:
             return super().add_query(sql, auto_begin, bindings, abridge_sql_log,
                                      retryable_exceptions, retry_limit)
         if bindings is not None:
             raise dbt_common.exceptions.DbtRuntimeError(
-                "Iceberg response recovery does not support query bindings"
+                "INSERT OVERWRITE response recovery does not support query bindings"
             )
 
         connection = self.get_thread_connection()
         credentials = self.get_credentials(connection.credentials)
         if credentials.is_async:
             raise dbt_common.exceptions.DbtRuntimeError(
-                "Iceberg response recovery is incompatible with is_async=true"
+                "INSERT OVERWRITE response recovery is incompatible with is_async=true"
             )
         if credentials.use_pure not in ("true", "True"):
             raise dbt_common.exceptions.DbtRuntimeError(
-                "Iceberg response recovery requires use_pure=true"
+                "INSERT OVERWRITE response recovery requires use_pure=true"
             )
         if retryable_exceptions or retry_limit != 1:
             raise dbt_common.exceptions.DbtRuntimeError(
-                "Iceberg response recovery cannot retry the INSERT"
+                "INSERT OVERWRITE response recovery cannot retry the INSERT"
             )
 
         attempt = RecoveryObserver(credentials, connection.handle)
         try:
-            marked_sql = mark_extracted_insert(sql, match, attempt.attempt_id)
+            marked_sql = mark_overwrite_insert(sql, match, attempt.attempt_id)
         except ValueError as exc:
             raise dbt_common.exceptions.DbtRuntimeError(str(exc)) from exc
         self._recovery_local.attempt = attempt
-        logger.info(f"Starting Iceberg response recovery attempt {attempt.attempt_id}")
+        logger.info(f"Starting INSERT OVERWRITE response recovery attempt {attempt.attempt_id}")
         with self._recoveries_lock:
             self._recoveries[id(attempt.old_handle)] = attempt
         stopped = False
@@ -295,12 +295,12 @@ class StarRocksConnectionManager(SQLConnectionManager):
                 result = super().add_query(marked_sql, auto_begin, bindings,
                                            abridge_sql_log, retryable_exceptions,
                                            retry_limit)
-            except _RecoveredIcebergInsert:
+            except _RecoveredOverwriteInsert:
                 attempt.stop()
                 stopped = True
                 self._replace_recovered_connection(connection)
                 logger.info(
-                    f"Recovered Iceberg attempt {attempt.attempt_id} "
+                    f"Recovered INSERT OVERWRITE attempt {attempt.attempt_id} "
                     f"with profile {attempt.finished_query_id}"
                 )
                 return connection, _RecoveredCursor(attempt.finished_query_id)
@@ -330,7 +330,7 @@ class StarRocksConnectionManager(SQLConnectionManager):
             is_transport_error = isinstance(e, mysql.connector.InterfaceError) or e.errno in (2006, 2013, 2055, 3024)
             if attempt is not None:
                 if is_transport_error and attempt.interrupted.is_set() and attempt.finished_query_id:
-                    raise _RecoveredIcebergInsert() from e
+                    raise _RecoveredOverwriteInsert() from e
                 # Any OperationalError can mean a broken transport. Never try
                 # rollback or QUIT on this handle; only known transport errors
                 # with a confirmed Finished profile may become success.
@@ -394,7 +394,7 @@ class StarRocksConnectionManager(SQLConnectionManager):
         return self.add_query("", auto_begin=False)
 
 
-class _RecoveredIcebergInsert(Exception):
+class _RecoveredOverwriteInsert(Exception):
     pass
 
 

@@ -1,4 +1,4 @@
-"""Observe one marked Iceberg INSERT without sending it a second time."""
+"""Observe one marked INSERT OVERWRITE without sending it a second time."""
 
 import re
 import threading
@@ -12,38 +12,54 @@ from dbt.adapters.events.logging import AdapterLogger
 
 logger = AdapterLogger("starrocks")
 
-ATTEMPT_PREFIX = "mmp_iceberg_attempt:"
+ATTEMPT_PREFIX = "mmp_overwrite_attempt:"
 POLL_SECONDS = 15
 RESPONSE_GRACE_SECONDS = 30
 OBSERVER_TIMEOUT_SECONDS = 10
 MAX_OBSERVE_SECONDS = 7200
-EXTRACTED_INSERT = re.compile(
-    r"(?is)\binsert\s*/\*\+\s*set_var\((?P<set_vars>[^)]*)\)\s*\*/"
+OVERWRITE_INSERT = re.compile(
+    r"(?is)^\s*(?:/\*.*?\*/\s*)*insert\s*/\*\+\s*set_var\((?P<set_vars>[^)]*)\)\s*\*/"
     r"\s*overwrite\s+(?P<target>[^\s(]+)"
 )
 PROFILE_SETTING = re.compile(r"(?i)(?:^|,)\s*enable_profile\s*=\s*([^,\s]+)")
+# The MMP materialization emits these hints for every incremental overwrite.
+# Requiring the full shape avoids changing unrelated adapter consumers.
+MMP_HINT_SETTINGS = {
+    "dynamic_overwrite",
+    "new_planner_optimize_timeout",
+    "query_timeout",
+    "insert_timeout",
+    "query_mem_limit",
+}
 
 
-def extracted_insert_match(sql):
-    """Match only the existing rawevents_extracted INSERT OVERWRITE shape."""
-    match = EXTRACTED_INSERT.search(sql)
+def overwrite_insert_match(sql):
+    """Match MMP's catalog-qualified INSERT OVERWRITE shape, regardless of table."""
+    match = OVERWRITE_INSERT.match(sql)
     if match is None:
         return None
-    target_parts = match.group("target").replace("`", "").split(".")
-    if not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in target_parts):
+    hint_settings = {
+        setting.split("=", 1)[0].strip().lower()
+        for setting in match.group("set_vars").split(",")
+        if "=" in setting
+    }
+    if not MMP_HINT_SETTINGS.issubset(hint_settings):
         return None
-    if target_parts[-1].lower() != "rawevents_extracted":
+    target_parts = match.group("target").replace("`", "").split(".")
+    if len(target_parts) != 3 or not all(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in target_parts
+    ):
         return None
     return match
 
 
-def mark_extracted_insert(sql, match, attempt_id):
+def mark_overwrite_insert(sql, match, attempt_id):
     """Enable this INSERT's profile and prepend a unique attempt marker."""
     set_vars = match.group("set_vars")
     profile_setting = PROFILE_SETTING.search(set_vars)
     if profile_setting is not None:
         if profile_setting.group(1).lower() != "true":
-            raise ValueError("rawevents_extracted recovery requires enable_profile = TRUE")
+            raise ValueError("INSERT OVERWRITE recovery requires enable_profile = TRUE")
     else:
         separator = ", " if set_vars.strip() else ""
         sql = (
@@ -67,7 +83,7 @@ class RecoveryObserver:
         self.error = None
         self.thread = threading.Thread(
             target=self._watch,
-            name=f"starrocks-iceberg-recovery-{self.attempt_id}",
+            name=f"starrocks-overwrite-recovery-{self.attempt_id}",
             daemon=True,
         )
 
@@ -78,7 +94,7 @@ class RecoveryObserver:
         self.done.set()
         self.thread.join(2 * OBSERVER_TIMEOUT_SECONDS + 5)
         if self.thread.is_alive():
-            raise RuntimeError("Iceberg recovery observer did not stop")
+            raise RuntimeError("INSERT OVERWRITE recovery observer did not stop")
 
     def _connect(self):
         kwargs = {
@@ -109,7 +125,7 @@ class RecoveryObserver:
             if self.marker in (row.get("Statement") or "")
         ]
         if len(matches) > 1:
-            raise RuntimeError("Multiple profiles matched the Iceberg attempt")
+            raise RuntimeError("Multiple profiles matched the INSERT OVERWRITE attempt")
         if not matches:
             return None
 
@@ -132,11 +148,11 @@ class RecoveryObserver:
         state = re.search(r"(?m)^\s*- Query State: (Finished|Running|Error)\s*$", profile)
         statement = re.search(r"(?m)^\s*- Sql Statement: (.*)$", profile)
         if not profile_id or profile_id.group(1) != query_id:
-            raise RuntimeError("Iceberg profile Query ID did not match PROFILELIST")
+            raise RuntimeError("INSERT OVERWRITE profile Query ID did not match PROFILELIST")
         if not statement or self.marker not in statement.group(1):
-            raise RuntimeError("Iceberg profile did not contain the attempt marker")
+            raise RuntimeError("INSERT OVERWRITE profile did not contain the attempt marker")
         if not state:
-            raise RuntimeError("Iceberg profile has no recognized Query State")
+            raise RuntimeError("INSERT OVERWRITE profile has no recognized Query State")
         return query_id, state.group(1)
 
     def _watch(self):
@@ -150,7 +166,7 @@ class RecoveryObserver:
                     query_id, state = found
                     self.observed_state = state
                     logger.info(
-                        f"Iceberg attempt {self.attempt_id} profile {query_id} state {state}"
+                        f"INSERT OVERWRITE attempt {self.attempt_id} profile {query_id} state {state}"
                     )
                     if state == "Finished":
                         self.finished_query_id = query_id
@@ -163,7 +179,7 @@ class RecoveryObserver:
                 self.done.wait(POLL_SECONDS)
         except Exception as exc:
             self.error = exc
-            logger.warning(f"Iceberg attempt {self.attempt_id} observer failed: {exc}")
+            logger.warning(f"INSERT OVERWRITE attempt {self.attempt_id} observer failed: {exc}")
         finally:
             if connection is not None:
                 connection.shutdown()

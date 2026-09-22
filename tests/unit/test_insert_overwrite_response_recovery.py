@@ -1,4 +1,4 @@
-"""Fail-closed tests for the targeted Iceberg INSERT response recovery path."""
+"""Fail-closed tests for catalog-qualified INSERT OVERWRITE recovery."""
 
 import importlib.util
 import sys
@@ -16,8 +16,14 @@ from dbt.adapters.sql import SQLConnectionManager
 
 ADAPTER_DIR = Path(__file__).resolve().parents[2] / "dbt/adapters/starrocks"
 EXTRACTED_INSERT = (
-    "insert /*+SET_VAR(dynamic_overwrite = TRUE)*/ "
+    "insert /*+SET_VAR(dynamic_overwrite = TRUE, "
+    "new_planner_optimize_timeout = 30000, query_timeout = 3600, "
+    "insert_timeout = 5400, query_mem_limit = 12884901888)*/ "
     "overwrite `glue`.`silver`.`rawevents_extracted` select 1"
+)
+OBT_INSERT = EXTRACTED_INSERT.replace("rawevents_extracted", "rawevents_obt")
+GOLD_INSERT = EXTRACTED_INSERT.replace(
+    "`glue`.`silver`.`rawevents_extracted`", "`default_catalog`.`mmp`.`campaign_data`"
 )
 
 
@@ -30,8 +36,8 @@ def _load_adapter_module(name, filename):
 
 
 recovery = _load_adapter_module(
-    "dbt.adapters.starrocks.iceberg_response_recovery",
-    "iceberg_response_recovery.py",
+    "dbt.adapters.starrocks.insert_overwrite_response_recovery",
+    "insert_overwrite_response_recovery.py",
 )
 connections = _load_adapter_module(
     "dbt.adapters.starrocks.connections", "connections.py"
@@ -92,8 +98,9 @@ class RecoveryConnectionTest(unittest.TestCase):
                 EXTRACTED_INSERT, auto_begin=False
             )
         self.assertIs(result[1], cursor)
-        self.assertTrue(parent.call_args.args[0].startswith("/* mmp_iceberg_attempt:"))
-        self.assertIn("dynamic_overwrite = TRUE, enable_profile = TRUE", parent.call_args.args[0])
+        self.assertTrue(parent.call_args.args[0].startswith("/* mmp_overwrite_attempt:"))
+        self.assertIn("dynamic_overwrite = TRUE", parent.call_args.args[0])
+        self.assertIn("enable_profile = TRUE", parent.call_args.args[0])
         FakeObserver.instances[0].start.assert_called_once()
         FakeObserver.instances[0].stop.assert_called_once()
         self.manager.open.assert_not_called()
@@ -154,8 +161,9 @@ class RecoveryConnectionTest(unittest.TestCase):
             _, recovered_cursor = self.manager.add_query(EXTRACTED_INSERT, auto_begin=False)
         self.assertEqual(query_id, recovered_cursor.query_id)
         self.assertEqual(1, len(sent_sql))
-        self.assertTrue(sent_sql[0].startswith("/* mmp_iceberg_attempt:"))
-        self.assertIn("dynamic_overwrite = TRUE, enable_profile = TRUE", sent_sql[0])
+        self.assertTrue(sent_sql[0].startswith("/* mmp_overwrite_attempt:"))
+        self.assertIn("dynamic_overwrite = TRUE", sent_sql[0])
+        self.assertIn("enable_profile = TRUE", sent_sql[0])
         self.manager.rollback_if_open.assert_not_called()
 
         next_cursor = mock.Mock()
@@ -164,6 +172,30 @@ class RecoveryConnectionTest(unittest.TestCase):
         _, returned_cursor = self.manager.add_query("select 1", auto_begin=False)
         self.assertIs(next_cursor, returned_cursor)
         next_cursor.execute.assert_called_once_with("select 1", None)
+
+    def test_obt_finished_and_interrupted_recovers_without_second_insert(self):
+        query_id = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
+        sent_sql = []
+
+        def lose_response(_manager, sql, *args):
+            sent_sql.append(sql)
+            attempt = FakeObserver.instances[0]
+            attempt.finished_query_id = query_id
+            attempt.interrupted.set()
+            with self.manager.exception_handler(sql):
+                raise mysql.connector.InterfaceError(errno=2013, msg="lost OBT response")
+
+        with mock.patch.object(connections, "RecoveryObserver", FakeObserver), mock.patch.object(
+            SQLConnectionManager, "add_query", lose_response
+        ):
+            _, cursor = self.manager.add_query(OBT_INSERT, auto_begin=False)
+
+        self.assertEqual(1, len(sent_sql))
+        self.assertIn("`rawevents_obt`", sent_sql[0])
+        self.assertEqual(query_id, cursor.query_id)
+        self.assertIsNone(self.manager.get_response(cursor).rows_affected)
+        self.manager.open.assert_called_once_with(self.connection)
+        self.manager.rollback_if_open.assert_not_called()
 
     def test_normal_response_racing_shutdown_reconnects(self):
         cursor = SimpleNamespace(rowcount=8)
@@ -297,22 +329,47 @@ class RecoveryConnectionTest(unittest.TestCase):
                     self.manager.add_query(EXTRACTED_INSERT)
                 setattr(self.credentials, field, False if field == "is_async" else "true")
 
-    def test_other_insert_targets_use_original_path(self):
+    def test_all_catalog_qualified_overwrite_targets_are_observed(self):
+        cursor = SimpleNamespace(rowcount=1)
+        with mock.patch.object(connections, "RecoveryObserver", FakeObserver), mock.patch.object(
+            SQLConnectionManager, "add_query", return_value=(self.connection, cursor)
+        ) as parent:
+            for statement in (EXTRACTED_INSERT, OBT_INSERT, GOLD_INSERT):
+                with self.subTest(statement=statement):
+                    self.assertIs(cursor, self.manager.add_query(statement, auto_begin=False)[1])
+                    self.assertIn("enable_profile = TRUE", parent.call_args.args[0])
+        self.assertEqual(3, parent.call_count)
+        self.assertEqual(3, len(FakeObserver.instances))
+
+    def test_other_sql_shapes_use_original_path(self):
         cursor = SimpleNamespace(rowcount=1)
         statements = (
-            EXTRACTED_INSERT.replace("rawevents_extracted", "rawevents_enriched"),
-            EXTRACTED_INSERT.replace("rawevents_extracted", "other_rawevents_extracted"),
             "insert overwrite `glue`.`silver`.`rawevents_extracted` select 1",
+            EXTRACTED_INSERT.replace("`glue`.`silver`.`rawevents_extracted`", "`silver`.`rawevents_extracted`"),
+            EXTRACTED_INSERT.replace("overwrite", "into"),
+            EXTRACTED_INSERT.replace("query_mem_limit = 12884901888", "other_setting = 1"),
+            "create table `glue`.`silver`.`new_table` as select 1",
+            "select '" + EXTRACTED_INSERT + "'",
         )
         with mock.patch.object(SQLConnectionManager, "add_query", return_value=(self.connection, cursor)) as parent:
             for statement in statements:
-                self.assertIs(cursor, self.manager.add_query(statement, auto_begin=False)[1])
+                with self.subTest(statement=statement):
+                    self.assertIs(cursor, self.manager.add_query(statement, auto_begin=False)[1])
+                    self.assertEqual(statement, parent.call_args.args[0])
         self.assertEqual(len(statements), parent.call_count)
+
+    def test_dbt_query_comment_before_insert_is_observed(self):
+        sql = '/* {"app": "dbt"} */\n' + OBT_INSERT
+        match = recovery.overwrite_insert_match(sql)
+        self.assertIsNotNone(match)
+        marked = recovery.mark_overwrite_insert(sql, match, "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")
+        self.assertTrue(marked.startswith("/* mmp_overwrite_attempt:"))
+        self.assertIn("enable_profile = TRUE", marked)
 
     def test_existing_profile_setting_is_not_duplicated(self):
         sql = EXTRACTED_INSERT.replace("dynamic_overwrite = TRUE", "dynamic_overwrite = TRUE, enable_profile = TRUE")
-        match = recovery.extracted_insert_match(sql)
-        marked = recovery.mark_extracted_insert(sql, match, "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")
+        match = recovery.overwrite_insert_match(sql)
+        marked = recovery.mark_overwrite_insert(sql, match, "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")
         self.assertEqual(1, marked.count("enable_profile = TRUE"))
 
     def test_conflicting_profile_setting_fails_before_insert(self):
