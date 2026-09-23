@@ -10,7 +10,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import mysql.connector
+import mysql.connector.errors
 
+import dbt_common.exceptions
 from dbt.adapters.sql import SQLConnectionManager
 
 
@@ -33,6 +35,28 @@ def _load_adapter_module(name, filename):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+# These names collide with the real package modules. Loading them here would
+# otherwise leak a second, distinct StarRocksConnectionManager class into
+# sys.modules for every test module collected afterward. Snapshot whatever
+# was there before (an already-imported real module, or nothing) and restore
+# it once this file's tests are done.
+_ORIGINAL_MODULES = {
+    name: sys.modules.get(name)
+    for name in (
+        "dbt.adapters.starrocks.insert_overwrite_response_recovery",
+        "dbt.adapters.starrocks.connections",
+    )
+}
+
+
+def tearDownModule():
+    for name, original in _ORIGINAL_MODULES.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
 
 
 recovery = _load_adapter_module(
@@ -298,10 +322,48 @@ class RecoveryConnectionTest(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "too many connections"):
                 self.manager.add_query(EXTRACTED_INSERT, auto_begin=False)
 
-        self.old_handle.shutdown.assert_called_once()
-        self.manager.rollback_if_open.assert_not_called()
+        # errno 1040 is a genuine server-side error on a healthy socket, not
+        # a transport failure: the connection must not be torn down for it.
+        self.old_handle.shutdown.assert_not_called()
+        self.manager.rollback_if_open.assert_called_once()
         self.manager.open.assert_not_called()
-        self.assertEqual("fail", self.connection.state)
+        self.assertEqual("open", self.connection.state)
+
+    def test_read_timeout_error_with_finished_profile_recovers(self):
+        # ReadTimeoutError (errno 3024) is the client's own read-timeout on a
+        # wedged socket. It subclasses Error directly, not
+        # InterfaceError/OperationalError, so it needs its own explicit match.
+        query_id = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
+
+        def blocked_insert(_manager, sql, *args):
+            attempt = FakeObserver.instances[0]
+            attempt.finished_query_id = query_id
+            attempt.interrupted.set()
+            with self.manager.exception_handler(sql):
+                raise mysql.connector.errors.ReadTimeoutError(
+                    errno=3024, msg="Timed out reading from socket"
+                )
+
+        with mock.patch.object(connections, "RecoveryObserver", FakeObserver), mock.patch.object(
+            SQLConnectionManager, "add_query", blocked_insert
+        ):
+            _, cursor = self.manager.add_query(EXTRACTED_INSERT, auto_begin=False)
+
+        self.assertEqual(query_id, cursor.query_id)
+        self.manager.rollback_if_open.assert_not_called()
+        self.manager.open.assert_called_once_with(self.connection)
+        self.assertEqual("open", self.connection.state)
+
+    def test_operational_error_without_active_attempt_stays_database_error(self):
+        # Outside a recovery attempt, OperationalError must keep its normal
+        # DbtDatabaseError classification for every other model in the
+        # adapter, not fall into the recovery-only DbtRuntimeError path.
+        with self.assertRaises(dbt_common.exceptions.DbtDatabaseError):
+            with self.manager.exception_handler("select 1"):
+                raise mysql.connector.OperationalError(
+                    errno=1205, msg="lock wait timeout exceeded"
+                )
+        self.manager.rollback_if_open.assert_called_once()
 
     def test_server_error_is_not_replaced_by_finished_profile(self):
         def failed_insert(_manager, sql, *args):
@@ -447,6 +509,30 @@ class ProfileIdentificationTest(unittest.TestCase):
         self.assertTrue(observer.interrupted.is_set())
         old_handle.shutdown.assert_called_once()
 
+    def test_transient_connection_error_is_retried_not_fatal(self):
+        old_handle = mock.Mock()
+        observer = recovery.RecoveryObserver(SimpleNamespace(), old_handle)
+        observer._connect = mock.Mock(
+            side_effect=[
+                mysql.connector.OperationalError(errno=2003, msg="cannot connect"),
+                mock.Mock(),
+            ]
+        )
+        observer._matching_profile = mock.Mock(return_value=(
+            "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb", "Finished"
+        ))
+        with mock.patch.object(recovery, "RESPONSE_GRACE_SECONDS", 0.02), \
+                mock.patch.object(recovery, "POLL_SECONDS", 0.01):
+            observer.start()
+            observer.thread.join(1)
+        self.assertFalse(observer.thread.is_alive())
+        # A blip on the observer's own connection is retried, not fatal to
+        # observation of the real INSERT.
+        self.assertEqual(2, observer._connect.call_count)
+        self.assertIsInstance(observer.error, mysql.connector.OperationalError)
+        self.assertTrue(observer.interrupted.is_set())
+        old_handle.shutdown.assert_called_once()
+
     def test_normal_completion_stops_observer_before_shutdown(self):
         old_handle = mock.Mock()
         observer = recovery.RecoveryObserver(SimpleNamespace(), old_handle)
@@ -491,6 +577,15 @@ class ProfileIdentificationTest(unittest.TestCase):
         connection.cursor.side_effect = [list_cursor, profile_cursor]
         with self.assertRaisesRegex(RuntimeError, "attempt marker"):
             observer._matching_profile(connection)
+
+    def test_stop_never_raises_when_thread_outlives_join_budget(self):
+        # stop() runs from add_query's finally block: it must never raise,
+        # or it would shadow a real in-flight exception, or fail a model
+        # whose INSERT actually succeeded, just because the observer thread
+        # is still finishing a slow network call.
+        observer = recovery.RecoveryObserver(SimpleNamespace(), mock.Mock())
+        observer.thread = SimpleNamespace(join=mock.Mock(), is_alive=mock.Mock(return_value=True))
+        observer.stop()  # must not raise
 
 
 if __name__ == "__main__":

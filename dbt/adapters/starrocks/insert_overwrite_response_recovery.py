@@ -92,9 +92,23 @@ class RecoveryObserver:
 
     def stop(self):
         self.done.set()
-        self.thread.join(2 * OBSERVER_TIMEOUT_SECONDS + 5)
+        # Worst case one _watch iteration blocks on connect + PROFILELIST +
+        # get_query_profile, each bounded by OBSERVER_TIMEOUT_SECONDS.
+        self.thread.join(3 * OBSERVER_TIMEOUT_SECONDS + 5)
         if self.thread.is_alive():
-            raise RuntimeError("INSERT OVERWRITE recovery observer did not stop")
+            # Never raise here: this runs from add_query's finally block and
+            # must not shadow a real in-flight exception or fail a model whose
+            # INSERT actually succeeded. The thread is a daemon; it will exit
+            # on its own once its current network call returns.
+            logger.warning(
+                f"INSERT OVERWRITE attempt {self.attempt_id} observer did not "
+                f"stop within the join timeout; abandoning it"
+            )
+        elif self.error is not None:
+            logger.warning(
+                f"INSERT OVERWRITE attempt {self.attempt_id} observer ended "
+                f"with error: {self.error}"
+            )
 
     def _connect(self):
         kwargs = {
@@ -159,9 +173,28 @@ class RecoveryObserver:
         connection = None
         started = time.monotonic()
         try:
-            connection = self._connect()
             while not self.done.is_set() and time.monotonic() - started < MAX_OBSERVE_SECONDS:
-                found = self._matching_profile(connection)
+                try:
+                    if connection is None:
+                        connection = self._connect()
+                    found = self._matching_profile(connection)
+                except mysql.connector.Error as exc:
+                    # The observer's own connection is disposable: a transient
+                    # network blip on it must not permanently end observation
+                    # of the real INSERT for the rest of MAX_OBSERVE_SECONDS.
+                    self.error = exc
+                    logger.warning(
+                        f"INSERT OVERWRITE attempt {self.attempt_id} observer "
+                        f"connection failed, retrying: {exc}"
+                    )
+                    if connection is not None:
+                        try:
+                            connection.shutdown()
+                        except Exception:
+                            pass
+                    connection = None
+                    self.done.wait(POLL_SECONDS)
+                    continue
                 if found:
                     query_id, state = found
                     self.observed_state = state
@@ -178,6 +211,9 @@ class RecoveryObserver:
                         return
                 self.done.wait(POLL_SECONDS)
         except Exception as exc:
+            # Integrity-check failures from _matching_profile (ambiguous or
+            # mismatched profile) are not retried: fail closed instead of
+            # guessing which profile belongs to this attempt.
             self.error = exc
             logger.warning(f"INSERT OVERWRITE attempt {self.attempt_id} observer failed: {exc}")
         finally:

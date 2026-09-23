@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from threading import Lock, local
 
 import mysql.connector
+from mysql.connector import errorcode
 from mysql.connector.constants import FieldType
 
 import dbt.exceptions
@@ -39,6 +40,18 @@ from dbt.adapters.starrocks.insert_overwrite_response_recovery import (
 )
 
 logger = AdapterLogger("starrocks")
+
+# errno values that mean the transport itself is broken, not a server-side
+# rejection. Checked as a fallback for OperationalError, whose errno alone
+# can't otherwise be told apart from a healthy-socket server error.
+TRANSPORT_ERRNOS = (
+    errorcode.CR_SERVER_GONE_ERROR,    # 2006: MySQL server has gone away
+    errorcode.CR_SERVER_LOST,          # 2013: Lost connection to MySQL server during query
+    errorcode.CR_SERVER_LOST_EXTENDED,  # 2055: Lost connection to MySQL server at '%s', system error: %d
+    errorcode.ER_QUERY_TIMEOUT,        # 3024: also the errno mysql-connector's own client-side
+                                        # ReadTimeoutError carries (see network.py), not just the
+                                        # server-side query timeout the name suggests
+)
 
 
 @dataclass
@@ -325,23 +338,50 @@ class StarRocksConnectionManager(SQLConnectionManager):
         try:
             yield
 
-        except (mysql.connector.InterfaceError, mysql.connector.OperationalError) as e:
+        except (mysql.connector.InterfaceError, mysql.connector.OperationalError,
+                 mysql.connector.errors.ReadTimeoutError) as e:
             attempt = getattr(self._recovery_local, 'attempt', None)
-            is_transport_error = isinstance(e, mysql.connector.InterfaceError) or e.errno in (2006, 2013, 2055, 3024)
-            if attempt is not None:
-                if is_transport_error and attempt.interrupted.is_set() and attempt.finished_query_id:
-                    raise _RecoveredOverwriteInsert() from e
-                # Any OperationalError can mean a broken transport. Never try
-                # rollback or QUIT on this handle; only known transport errors
-                # with a confirmed Finished profile may become success.
-                attempt.old_handle.shutdown()
-                connection = self.get_thread_connection()
-                connection.handle = None
-                connection.state = 'fail'
-                connection.transaction_open = False
+            # ReadTimeoutError (errno 3024) is the client's own read-timeout on a
+            # wedged socket and does NOT subclass InterfaceError/OperationalError;
+            # it must be matched explicitly, not just via e.errno on the others.
+            is_transport_error = (
+                isinstance(e, (mysql.connector.InterfaceError, mysql.connector.errors.ReadTimeoutError))
+                or getattr(e, 'errno', None) in TRANSPORT_ERRNOS
+            )
+            if attempt is None:
+                if isinstance(e, mysql.connector.OperationalError):
+                    # No active recovery attempt: keep OperationalError's normal
+                    # classification for every other model in the adapter.
+                    logger.debug('StarRocks error: {}'.format(str(e)))
+                    try:
+                        self.rollback_if_open()
+                    except mysql.connector.Error:
+                        logger.debug("Failed to release connection!")
+                        pass
+                    raise dbt_common.exceptions.DbtDatabaseError(str(e).strip()) from e
+                logger.debug('StarRocks transport error: {}'.format(str(e)))
+                self.rollback_if_open()
                 raise dbt_common.exceptions.DbtRuntimeError(str(e)) from e
-            logger.debug('StarRocks transport error: {}'.format(str(e)))
-            self.rollback_if_open()
+
+            if is_transport_error and attempt.interrupted.is_set() and attempt.finished_query_id:
+                raise _RecoveredOverwriteInsert() from e
+            if not is_transport_error:
+                # A genuine server-side error on a still-healthy socket. Don't
+                # tear the connection down for it.
+                logger.debug('StarRocks error: {}'.format(str(e)))
+                try:
+                    self.rollback_if_open()
+                except mysql.connector.Error:
+                    logger.debug("Failed to release connection!")
+                    pass
+                raise dbt_common.exceptions.DbtDatabaseError(str(e).strip()) from e
+            # A confirmed broken transport that recovery could not confirm as
+            # finished. Never try rollback or QUIT on this handle.
+            attempt.old_handle.shutdown()
+            connection = self.get_thread_connection()
+            connection.handle = None
+            connection.state = 'fail'
+            connection.transaction_open = False
             raise dbt_common.exceptions.DbtRuntimeError(str(e)) from e
 
         except mysql.connector.DatabaseError as e:
