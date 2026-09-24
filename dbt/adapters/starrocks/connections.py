@@ -14,8 +14,10 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+from threading import Lock, local
 
 import mysql.connector
+from mysql.connector import errorcode
 from mysql.connector.constants import FieldType
 
 import dbt.exceptions
@@ -31,7 +33,25 @@ from dbt.adapters.sql import SQLConnectionManager
 from dbt.adapters.events.logging import AdapterLogger
 from typing import Optional, Union
 
+from dbt.adapters.starrocks.insert_overwrite_response_recovery import (
+    RecoveryObserver,
+    overwrite_insert_match,
+    mark_overwrite_insert,
+)
+
 logger = AdapterLogger("starrocks")
+
+# errno values that mean the transport itself is broken, not a server-side
+# rejection. Checked as a fallback for OperationalError, whose errno alone
+# can't otherwise be told apart from a healthy-socket server error.
+TRANSPORT_ERRNOS = (
+    errorcode.CR_SERVER_GONE_ERROR,    # 2006: MySQL server has gone away
+    errorcode.CR_SERVER_LOST,          # 2013: Lost connection to MySQL server during query
+    errorcode.CR_SERVER_LOST_EXTENDED,  # 2055: Lost connection to MySQL server at '%s', system error: %d
+    errorcode.ER_QUERY_TIMEOUT,        # 3024: also the errno mysql-connector's own client-side
+                                        # ReadTimeoutError carries (see network.py), not just the
+                                        # server-side query timeout the name suggests
+)
 
 
 @dataclass
@@ -130,6 +150,9 @@ def _parse_version(result):
 
 class StarRocksConnectionManager(SQLConnectionManager):
     TYPE = 'starrocks'
+    _recovery_local = local()
+    _recoveries_lock = Lock()
+    _recoveries = {}
     TYPE_CODE_TO_NAME = {
         FieldType.DECIMAL: "decimal",
         FieldType.NEWDECIMAL: "decimal",
@@ -239,12 +262,138 @@ class StarRocksConnectionManager(SQLConnectionManager):
         return credentials
 
     def cancel(self, connection: Connection):
-        connection.handle.close()
+        handle = connection.handle
+        with self._recoveries_lock:
+            attempt = self._recoveries.get(id(handle))
+        if attempt is not None:
+            attempt.done.set()
+            handle.shutdown()
+        else:
+            handle.close()
+
+    def _replace_recovered_connection(self, connection):
+        connection.handle = None
+        connection.state = 'init'
+        connection.transaction_open = False
+        self.open(connection)
+
+    def add_query(self, sql, auto_begin=True, bindings=None, abridge_sql_log=False,
+                  retryable_exceptions=tuple(), retry_limit=1):
+        match = overwrite_insert_match(sql)
+        if match is None:
+            return super().add_query(sql, auto_begin, bindings, abridge_sql_log,
+                                     retryable_exceptions, retry_limit)
+        if bindings is not None:
+            raise dbt_common.exceptions.DbtRuntimeError(
+                "INSERT OVERWRITE response recovery does not support query bindings"
+            )
+
+        connection = self.get_thread_connection()
+        credentials = self.get_credentials(connection.credentials)
+        if credentials.is_async:
+            raise dbt_common.exceptions.DbtRuntimeError(
+                "INSERT OVERWRITE response recovery is incompatible with is_async=true"
+            )
+        if credentials.use_pure not in ("true", "True"):
+            raise dbt_common.exceptions.DbtRuntimeError(
+                "INSERT OVERWRITE response recovery requires use_pure=true"
+            )
+        if retryable_exceptions or retry_limit != 1:
+            raise dbt_common.exceptions.DbtRuntimeError(
+                "INSERT OVERWRITE response recovery cannot retry the INSERT"
+            )
+
+        attempt = RecoveryObserver(credentials, connection.handle)
+        try:
+            marked_sql = mark_overwrite_insert(sql, match, attempt.attempt_id)
+        except ValueError as exc:
+            raise dbt_common.exceptions.DbtRuntimeError(str(exc)) from exc
+        self._recovery_local.attempt = attempt
+        logger.info(f"Starting INSERT OVERWRITE response recovery attempt {attempt.attempt_id}")
+        with self._recoveries_lock:
+            self._recoveries[id(attempt.old_handle)] = attempt
+        stopped = False
+        try:
+            attempt.start()
+            try:
+                result = super().add_query(marked_sql, auto_begin, bindings,
+                                           abridge_sql_log, retryable_exceptions,
+                                           retry_limit)
+            except _RecoveredOverwriteInsert:
+                attempt.stop()
+                stopped = True
+                self._replace_recovered_connection(connection)
+                logger.info(
+                    f"Recovered INSERT OVERWRITE attempt {attempt.attempt_id} "
+                    f"with profile {attempt.finished_query_id}"
+                )
+                return connection, _RecoveredCursor(attempt.finished_query_id)
+            attempt.stop()
+            stopped = True
+            if attempt.interrupted.is_set():
+                # The normal response can race with the 30-second grace timer.
+                # Never hand the next model a handle the observer shut down.
+                self._replace_recovered_connection(connection)
+            return result
+        finally:
+            try:
+                if not stopped:
+                    attempt.stop()
+            finally:
+                self._recovery_local.attempt = None
+                with self._recoveries_lock:
+                    self._recoveries.pop(id(attempt.old_handle), None)
 
     @contextmanager
     def exception_handler(self, sql):
         try:
             yield
+
+        except (mysql.connector.InterfaceError, mysql.connector.OperationalError,
+                 mysql.connector.errors.ReadTimeoutError) as e:
+            attempt = getattr(self._recovery_local, 'attempt', None)
+            # ReadTimeoutError (errno 3024) is the client's own read-timeout on a
+            # wedged socket and does NOT subclass InterfaceError/OperationalError;
+            # it must be matched explicitly, not just via e.errno on the others.
+            is_transport_error = (
+                isinstance(e, (mysql.connector.InterfaceError, mysql.connector.errors.ReadTimeoutError))
+                or getattr(e, 'errno', None) in TRANSPORT_ERRNOS
+            )
+            if attempt is None:
+                if isinstance(e, mysql.connector.OperationalError):
+                    # No active recovery attempt: keep OperationalError's normal
+                    # classification for every other model in the adapter.
+                    logger.debug('StarRocks error: {}'.format(str(e)))
+                    try:
+                        self.rollback_if_open()
+                    except mysql.connector.Error:
+                        logger.debug("Failed to release connection!")
+                        pass
+                    raise dbt_common.exceptions.DbtDatabaseError(str(e).strip()) from e
+                logger.debug('StarRocks transport error: {}'.format(str(e)))
+                self.rollback_if_open()
+                raise dbt_common.exceptions.DbtRuntimeError(str(e)) from e
+
+            if is_transport_error and attempt.interrupted.is_set() and attempt.finished_query_id:
+                raise _RecoveredOverwriteInsert() from e
+            if not is_transport_error:
+                # A genuine server-side error on a still-healthy socket. Don't
+                # tear the connection down for it.
+                logger.debug('StarRocks error: {}'.format(str(e)))
+                try:
+                    self.rollback_if_open()
+                except mysql.connector.Error:
+                    logger.debug("Failed to release connection!")
+                    pass
+                raise dbt_common.exceptions.DbtDatabaseError(str(e).strip()) from e
+            # A confirmed broken transport that recovery could not confirm as
+            # finished. Never try rollback or QUIT on this handle.
+            attempt.old_handle.shutdown()
+            connection = self.get_thread_connection()
+            connection.handle = None
+            connection.state = 'fail'
+            connection.transaction_open = False
+            raise dbt_common.exceptions.DbtRuntimeError(str(e)) from e
 
         except mysql.connector.DatabaseError as e:
             logger.debug('StarRocks error: {}'.format(str(e)))
@@ -271,6 +420,13 @@ class StarRocksConnectionManager(SQLConnectionManager):
 
     @classmethod
     def get_response(cls, cursor) -> AdapterResponse:
+        if isinstance(cursor, _RecoveredCursor):
+            return AdapterResponse(
+                _message=f"SUCCESS recovered query_id={cursor.query_id} rows=unknown",
+                rows_affected=None,
+                code="SUCCESS",
+                query_id=cursor.query_id,
+            )
         code = "SUCCESS"
         num_rows = 0
 
@@ -287,3 +443,17 @@ class StarRocksConnectionManager(SQLConnectionManager):
 
     def add_begin_query(self):
         return self.add_query("", auto_begin=False)
+
+
+class _RecoveredOverwriteInsert(Exception):
+    pass
+
+
+class _RecoveredCursor:
+    rowcount = None
+
+    def __init__(self, query_id):
+        self.query_id = query_id
+
+    def close(self):
+        pass
